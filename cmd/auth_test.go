@@ -3,6 +3,7 @@ package cmd
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -17,6 +18,7 @@ import (
 
 	"github.com/dynatrace-oss/dtctl/pkg/auth"
 	"github.com/dynatrace-oss/dtctl/pkg/config"
+	"github.com/dynatrace-oss/dtctl/pkg/diagnostic"
 )
 
 // setupAuthTestConfig creates a temporary config with the given context and returns the path.
@@ -992,6 +994,61 @@ func TestAuthLogin_ClientCredentials_ReportsTokenAuthority(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+// TestAuthRefresh_NoRefreshToken_PointsAtLogin covers the dead end a client
+// credentials token creates: it carries no refresh token by design, so
+// `auth refresh` can never succeed for it and has to say what will.
+func TestAuthRefresh_NoRefreshToken_PointsAtLogin(t *testing.T) {
+	viper.Reset()
+	t.Setenv("DTCTL_DISABLE_KEYRING", "1")
+	t.Setenv(config.EnvTokenStorage, "file")
+	dataHome := t.TempDir()
+	t.Setenv("XDG_DATA_HOME", dataHome)
+	xdg.Reload()
+	t.Cleanup(xdg.Reload)
+
+	const (
+		ctxName   = "cc-refresh-ctx"
+		envURL    = "https://abc12345.apps.dynatrace.com"
+		tokenName = ctxName + "-oauth"
+	)
+
+	cfgFile = setupAuthTestConfig(t, ctxName, envURL, tokenName)
+	defer func() { cfgFile = "" }()
+
+	// Store a token set shaped like one from the client credentials grant:
+	// an access token and no refresh token.
+	tokenManager, err := auth.NewTokenManager(auth.OAuthConfigFromEnvironmentURL(envURL))
+	if err != nil {
+		t.Fatalf("new token manager: %v", err)
+	}
+	if err := tokenManager.SaveToken(tokenName, &auth.TokenSet{
+		AccessToken: "test-access-token",
+		TokenType:   "Bearer",
+		ExpiresIn:   300,
+		ExpiresAt:   time.Now().Add(5 * time.Minute),
+	}); err != nil {
+		t.Fatalf("save token: %v", err)
+	}
+
+	rootCmd.SetArgs([]string{"auth", "refresh", ctxName})
+	err = rootCmd.Execute()
+	if err == nil {
+		t.Fatal("expected auth refresh to fail for a token with no refresh token")
+	}
+
+	var diagErr *diagnostic.Error
+	if !errors.As(err, &diagErr) {
+		t.Fatalf("expected a diagnostic.Error carrying suggestions, got %T: %v", err, err)
+	}
+	if !errors.Is(err, auth.ErrNoRefreshToken) {
+		t.Errorf("expected the error to wrap auth.ErrNoRefreshToken, got: %v", err)
+	}
+	joined := strings.Join(diagErr.Suggestions, "\n")
+	if !strings.Contains(joined, "dtctl auth login --context "+ctxName) {
+		t.Errorf("expected a suggestion to re-run auth login for %q, got:\n%s", ctxName, joined)
 	}
 }
 

@@ -60,8 +60,8 @@ This grant authenticates the application itself rather than a user, so no
 refresh token is issued ([RFC 6749 §4.4.3](https://www.rfc-editor.org/rfc/rfc6749#section-4.4.3)).
 A client that holds its own credentials does not need one -- run `dtctl auth
 login` again to obtain a fresh access token when the current one expires. With
-no refresh token stored, a command that runs after expiry fails with
-`no refresh token available` rather than renewing silently.
+no refresh token stored there is nothing to renew in place, so `dtctl auth
+refresh` fails and points back at `auth login`.
 
 `--timeout` (default `5m`) bounds the token request, so a stalled token
 endpoint fails the pipeline step instead of holding the runner.

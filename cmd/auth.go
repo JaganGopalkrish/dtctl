@@ -2,6 +2,7 @@ package cmd
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"strings"
@@ -886,6 +887,20 @@ to force a refresh.`,
 		output.PrintInfo("Refreshing OAuth tokens...")
 		tokens, err := tokenManager.RefreshToken(tokenName)
 		if err != nil {
+			// A client credentials token has no refresh token by design, so
+			// "refresh" is a dead end for it — point at the way out instead of
+			// reporting a missing token the operator cannot supply.
+			if errors.Is(err, auth.ErrNoRefreshToken) {
+				return &diagnostic.Error{
+					Operation: "auth refresh",
+					Message:   fmt.Sprintf("context %q has no refresh token, so its access token cannot be renewed in place", contextName),
+					Suggestions: []string{
+						fmt.Sprintf("Run 'dtctl auth login --context %s' to obtain a new access token", contextName),
+						"A token from the client credentials grant never carries a refresh token (RFC 6749 section 4.4.3); re-running login is the renewal path",
+					},
+					Err: err,
+				}
+			}
 			return fmt.Errorf("failed to refresh tokens: %w", err)
 		}
 
