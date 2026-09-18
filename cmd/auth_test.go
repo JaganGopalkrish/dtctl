@@ -1,13 +1,17 @@
 package cmd
 
 import (
+	"bytes"
 	"context"
 	"fmt"
+	"io"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/adrg/xdg"
 	"github.com/spf13/pflag"
 	"github.com/spf13/viper"
 
@@ -769,7 +773,7 @@ func TestAuthLogin_ClientCredentialsValidation(t *testing.T) {
 			env:  map[string]string{envLoginClientSecret: "dt0s02.EXAMPLE.SECRET"},
 		},
 		{
-			name: "flag id combined with environment secret is not enough on its own",
+			name: "flag id with the environment secret explicitly empty",
 			args: []string{"--client-id", "dt0s02.EXAMPLE"},
 			env:  map[string]string{envLoginClientSecret: ""},
 		},
@@ -814,6 +818,11 @@ func TestAuthLogin_ClientCredentials_SkipsBrowserFlow(t *testing.T) {
 	resetAuthLoginFlags(t)
 	t.Setenv("DTCTL_DISABLE_KEYRING", "1")
 	t.Setenv(config.EnvTokenStorage, "file")
+	// The command really does store the minted token, so keep the file store
+	// off the developer's own ~/.local/share/dtctl.
+	t.Setenv("XDG_DATA_HOME", t.TempDir())
+	xdg.Reload()
+	t.Cleanup(xdg.Reload)
 	t.Setenv(envLoginClientID, "dt0s02.EXAMPLE")
 	t.Setenv(envLoginClientSecret, "dt0s02.EXAMPLE.SECRET")
 	t.Setenv(envLoginAccountURN, "urn:dtaccount:00000000-0000-0000-0000-000000000000")
@@ -838,9 +847,11 @@ func TestAuthLogin_ClientCredentials_SkipsBrowserFlow(t *testing.T) {
 
 	origGrant := authClientCredentialsFunc
 	defer func() { authClientCredentialsFunc = origGrant }()
-	authClientCredentialsFunc = func(_ *auth.OAuthFlow, clientID, clientSecret, resource string, scopes []string) (*auth.TokenSet, error) {
+	var gotDeadline time.Time
+	authClientCredentialsFunc = func(ctx context.Context, _ *auth.OAuthFlow, clientID, clientSecret, resource string, scopes []string) (*auth.TokenSet, error) {
 		called = true
 		gotID, gotSecret, gotResource, gotScopes = clientID, clientSecret, resource, scopes
+		gotDeadline, _ = ctx.Deadline()
 		return &auth.TokenSet{
 			AccessToken: "test-access-token",
 			TokenType:   "Bearer",
@@ -849,11 +860,9 @@ func TestAuthLogin_ClientCredentials_SkipsBrowserFlow(t *testing.T) {
 		}, nil
 	}
 
-	// A timeout only bounds the interactive flow. An impossible one proves the
-	// command never entered it.
 	rootCmd.SetArgs([]string{
 		"auth", "login", "--context", ctxName, "--environment", envURL,
-		"--timeout", "1ns", "--scopes", "storage:logs:read,storage:buckets:read",
+		"--timeout", "90s", "--scopes", "storage:logs:read,storage:buckets:read",
 	})
 	if err := rootCmd.Execute(); err != nil {
 		t.Fatalf("expected the non-interactive login to succeed, got: %v", err)
@@ -873,5 +882,215 @@ func TestAuthLogin_ClientCredentials_SkipsBrowserFlow(t *testing.T) {
 	}
 	if len(gotScopes) != 2 || gotScopes[0] != "storage:logs:read" || gotScopes[1] != "storage:buckets:read" {
 		t.Errorf("scopes = %v, want the two scopes passed via --scopes", gotScopes)
+	}
+	// --timeout must bound the token request too, not just the browser flow.
+	if gotDeadline.IsZero() {
+		t.Fatal("the grant was called with a context that carries no deadline; --timeout was dropped")
+	}
+	if remaining := time.Until(gotDeadline); remaining <= 0 || remaining > 90*time.Second {
+		t.Errorf("context deadline is %v away, want it derived from --timeout 90s", remaining)
+	}
+}
+
+// TestAuthLogin_ClientCredentials_ReportsTokenAuthority covers the reporting
+// around the safety level. The browser flow requests the safety level's scope
+// set at the IdP, so there the stored safety level and the token's authority
+// move together; this grant requests only --scopes, so without them the token
+// keeps the OAuth client's full granted set while the context still records
+// the chosen level. The command has to say so.
+func TestAuthLogin_ClientCredentials_ReportsTokenAuthority(t *testing.T) {
+	const envURL = "https://abc12345.apps.dynatrace.com"
+
+	tests := []struct {
+		name        string
+		args        []string
+		grantedFrom string
+		wantStderr  []string
+		notStderr   []string
+	}{
+		{
+			name:        "no scopes with a narrowing safety level warns",
+			args:        []string{"--safety-level", "readonly"},
+			grantedFrom: "storage:logs:read storage:buckets:read",
+			wantStderr: []string{
+				"the token carries every scope the OAuth client was granted",
+				"--safety-level readonly gates dtctl itself; it does not narrow the token",
+				// The endpoint may return fewer scopes than requested, so the
+				// token's real scopes are what gets reported.
+				"Granted scopes: storage:logs:read storage:buckets:read",
+			},
+		},
+		{
+			name:        "no scopes with dangerously-unrestricted does not warn about narrowing",
+			args:        []string{"--safety-level", "dangerously-unrestricted"},
+			grantedFrom: "storage:logs:read",
+			wantStderr:  []string{"the token carries every scope the OAuth client was granted"},
+			notStderr:   []string{"does not narrow the token"},
+		},
+		{
+			name:        "explicit scopes suppress the warning",
+			args:        []string{"--safety-level", "readonly", "--scopes", "storage:logs:read"},
+			grantedFrom: "storage:logs:read",
+			notStderr: []string{
+				"the token carries every scope the OAuth client was granted",
+				"does not narrow the token",
+			},
+		},
+	}
+
+	for i, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			viper.Reset()
+			resetAuthLoginFlags(t)
+			t.Setenv("DTCTL_DISABLE_KEYRING", "1")
+			t.Setenv(config.EnvTokenStorage, "file")
+			t.Setenv("XDG_DATA_HOME", t.TempDir())
+			xdg.Reload()
+			t.Cleanup(xdg.Reload)
+			t.Setenv(envLoginClientID, "dt0s02.EXAMPLE")
+			t.Setenv(envLoginClientSecret, "dt0s02.EXAMPLE.SECRET")
+			t.Setenv(envLoginAccountURN, "")
+
+			ctxName := fmt.Sprintf("cc-report-ctx-%d", i)
+			cfgFile = setupAuthTestConfig(t, ctxName, envURL, ctxName+"-oauth")
+			defer func() { cfgFile = "" }()
+
+			origCheck := authCheckKeyringFunc
+			defer func() { authCheckKeyringFunc = origCheck }()
+			authCheckKeyringFunc = func() error {
+				return fmt.Errorf("keyring disabled via %s environment variable", config.EnvDisableKeyring)
+			}
+
+			origGrant := authClientCredentialsFunc
+			defer func() { authClientCredentialsFunc = origGrant }()
+			authClientCredentialsFunc = func(context.Context, *auth.OAuthFlow, string, string, string, []string) (*auth.TokenSet, error) {
+				return &auth.TokenSet{
+					AccessToken: "test-access-token",
+					TokenType:   "Bearer",
+					ExpiresIn:   300,
+					Scope:       tt.grantedFrom,
+					ExpiresAt:   time.Now().Add(5 * time.Minute),
+				}, nil
+			}
+
+			args := append([]string{"auth", "login", "--context", ctxName, "--environment", envURL}, tt.args...)
+			stderr := captureAuthStderr(t, func() {
+				rootCmd.SetArgs(args)
+				if err := rootCmd.Execute(); err != nil {
+					t.Errorf("auth login: %v", err)
+				}
+			})
+
+			for _, want := range tt.wantStderr {
+				if !strings.Contains(stderr, want) {
+					t.Errorf("stderr missing %q, got:\n%s", want, stderr)
+				}
+			}
+			for _, unwanted := range tt.notStderr {
+				if strings.Contains(stderr, unwanted) {
+					t.Errorf("stderr unexpectedly contains %q, got:\n%s", unwanted, stderr)
+				}
+			}
+		})
+	}
+}
+
+// captureAuthStderr runs fn while capturing everything written to os.Stderr,
+// which is where output.Print* sends progress and warnings.
+func captureAuthStderr(t *testing.T, fn func()) string {
+	t.Helper()
+	orig := os.Stderr
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("os.Pipe: %v", err)
+	}
+	os.Stderr = w
+	done := make(chan string, 1)
+	go func() {
+		var buf bytes.Buffer
+		_, _ = io.Copy(&buf, r)
+		done <- buf.String()
+	}()
+	fn()
+	_ = w.Close()
+	os.Stderr = orig
+	return <-done
+}
+
+// TestAuthLogin_ClientCredentials_PartialInputDoesNotFallBackToBrowser covers
+// the parameters that only make sense for the client credentials grant. Left
+// out of the trigger they would reach the browser flow, which on a CI runner
+// is an unexplained hang until --timeout expires rather than an error.
+func TestAuthLogin_ClientCredentials_PartialInputDoesNotFallBackToBrowser(t *testing.T) {
+	const (
+		ctxName = "cc-partial-ctx"
+		envURL  = "https://abc12345.apps.dynatrace.com"
+	)
+
+	tests := []struct {
+		name     string
+		args     []string
+		env      map[string]string
+		wantHint string
+	}{
+		{
+			name:     "account urn from environment with no credentials",
+			env:      map[string]string{envLoginAccountURN: "urn:dtaccount:00000000-0000-0000-0000-000000000000"},
+			wantHint: "neither was supplied",
+		},
+		{
+			name:     "account urn flag with no credentials",
+			args:     []string{"--account-urn", "urn:dtaccount:00000000-0000-0000-0000-000000000000"},
+			wantHint: "neither was supplied",
+		},
+		{
+			name:     "scopes with no credentials",
+			args:     []string{"--scopes", "storage:logs:read"},
+			wantHint: "neither was supplied",
+		},
+		{
+			name:     "account urn with only a client id",
+			args:     []string{"--account-urn", "urn:dtaccount:00000000-0000-0000-0000-000000000000", "--client-id", "dt0s02.EXAMPLE"},
+			wantHint: "the client secret is missing",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			viper.Reset()
+			resetAuthLoginFlags(t)
+			for _, name := range []string{envLoginClientID, envLoginClientSecret, envLoginAccountURN} {
+				t.Setenv(name, "")
+			}
+			for k, v := range tt.env {
+				t.Setenv(k, v)
+			}
+
+			// If the trigger regressed, the browser flow would start here; a
+			// tiny timeout keeps the failure fast instead of hanging the suite.
+			origGrant := authClientCredentialsFunc
+			defer func() { authClientCredentialsFunc = origGrant }()
+			authClientCredentialsFunc = func(context.Context, *auth.OAuthFlow, string, string, string, []string) (*auth.TokenSet, error) {
+				t.Fatal("the grant must not run without a complete credential pair")
+				return nil, nil
+			}
+
+			cfgFile = setupAuthTestConfig(t, ctxName, envURL, ctxName+"-oauth")
+			defer func() { cfgFile = "" }()
+
+			args := append([]string{"auth", "login", "--context", ctxName, "--environment", envURL, "--timeout", "1ns"}, tt.args...)
+			rootCmd.SetArgs(args)
+			err := rootCmd.Execute()
+
+			if err == nil {
+				t.Fatal("expected a usage error, got nil")
+			}
+			if !strings.Contains(err.Error(), "requires both a client ID and a client secret") {
+				t.Errorf("expected the incomplete-pair error, got: %v", err)
+			}
+			if !strings.Contains(err.Error(), tt.wantHint) {
+				t.Errorf("expected the error to name the missing half (%q), got: %v", tt.wantHint, err)
+			}
+		})
 	}
 }

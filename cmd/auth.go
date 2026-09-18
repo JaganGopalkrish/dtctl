@@ -32,8 +32,8 @@ var (
 // authClientCredentialsFunc performs the client credentials grant during
 // auth login. It defaults to the real implementation and can be overridden in
 // tests to exercise the non-interactive branch without a token endpoint.
-var authClientCredentialsFunc = func(flow *auth.OAuthFlow, clientID, clientSecret, resource string, scopes []string) (*auth.TokenSet, error) {
-	return flow.ClientCredentials(clientID, clientSecret, resource, scopes)
+var authClientCredentialsFunc = func(ctx context.Context, flow *auth.OAuthFlow, clientID, clientSecret, resource string, scopes []string) (*auth.TokenSet, error) {
+	return flow.ClientCredentials(ctx, clientID, clientSecret, resource, scopes)
 }
 
 // authCmd represents the auth command
@@ -399,6 +399,20 @@ const (
 	envLoginAccountURN   = "DTCTL_ACCOUNT_URN"
 )
 
+// describeMissingClientCredentials names the half of the credential pair that
+// was not supplied, so the operator does not have to guess which of the two
+// sources (flag or environment variable) failed to reach the command.
+func describeMissingClientCredentials(clientID, clientSecret string) string {
+	switch {
+	case clientID == "" && clientSecret == "":
+		return "neither was supplied"
+	case clientID == "":
+		return "the client ID is missing"
+	default:
+		return "the client secret is missing"
+	}
+}
+
 // authLoginCmd initiates browser-based OAuth login
 var authLoginCmd = &cobra.Command{
 	Use:   "login",
@@ -439,7 +453,11 @@ Non-interactive login (CI/CD):
 
   This grant authenticates the application itself, so there is no user identity
   and, per RFC 6749 section 4.4.3, no refresh token is issued. Run the command
-  again to obtain a new access token when the current one expires.`,
+  again to obtain a new access token when the current one expires.
+
+  --timeout bounds the token request, and --safety-level still gates dtctl
+  itself. The safety level does not narrow the token: without --scopes the
+  token carries every scope the OAuth client was granted.`,
 	Example: `  # Re-authenticate the current context (e.g. after token expiry)
   dtctl auth login
 
@@ -482,16 +500,21 @@ Non-interactive login (CI/CD):
 			accountURN = os.Getenv(envLoginAccountURN)
 		}
 
-		// Any credential material selects the non-interactive grant.
-		nonInteractive := clientID != "" || clientSecret != ""
+		// Any client credentials input at all selects the non-interactive grant,
+		// including the parameters that are useless without the pair. Falling
+		// back to the browser flow because half the configuration is missing is
+		// the unexplained hang that this command exists to avoid.
+		nonInteractive := clientID != "" || clientSecret != "" || accountURN != "" || len(grantScopes) > 0
 		if nonInteractive && (clientID == "" || clientSecret == "") {
 			return &diagnostic.Error{
 				Operation: "auth login",
-				Message:   "the client credentials grant requires both a client ID and a client secret",
+				Message: fmt.Sprintf("the client credentials grant requires both a client ID and a client secret (%s)",
+					describeMissingClientCredentials(clientID, clientSecret)),
 				Suggestions: []string{
 					fmt.Sprintf("Set both %s and %s", envLoginClientID, envLoginClientSecret),
 					"Or pass --client-id and --client-secret",
-					"Omit both to use the interactive browser login",
+					fmt.Sprintf("Omit all of --client-id/--client-secret/--account-urn/--scopes (and %s/%s/%s) to use the interactive browser login",
+						envLoginClientID, envLoginClientSecret, envLoginAccountURN),
 				},
 			}
 		}
@@ -621,23 +644,39 @@ Non-interactive login (CI/CD):
 			return fmt.Errorf("failed to initialize OAuth: %w", err)
 		}
 
+		// --timeout bounds the whole login attempt, whichever grant is used: an
+		// unbounded token request is exactly the CI hang this command avoids.
+		ctx, cancel := context.WithTimeout(context.Background(), timeout)
+		defer cancel()
+
 		var tokens *auth.TokenSet
 		if nonInteractive {
 			// Client credentials grant: no browser, no redirect, no user. Scopes
 			// default to whatever the OAuth client was granted unless --scopes
 			// narrows them.
+			if len(grantScopes) == 0 {
+				output.PrintWarning("No --scopes given: the token carries every scope the OAuth client was granted.")
+				// The browser flow requests the safety level's scope set at the
+				// IdP, so there the two move together. Here they do not, and a
+				// narrowing safety level would otherwise read as if it had.
+				if safetyLevel != config.SafetyLevelDangerouslyUnrestricted {
+					output.PrintWarning("--safety-level %s gates dtctl itself; it does not narrow the token.", safetyLevel)
+					output.PrintHint("Pass --scopes, or provision the OAuth client with only the scopes this pipeline needs.")
+				}
+			}
 			output.PrintInfo("Authenticating with the client credentials grant (no browser)...")
-			tokens, err = authClientCredentialsFunc(flow, clientID, clientSecret, accountURN, grantScopes)
+			tokens, err = authClientCredentialsFunc(ctx, flow, clientID, clientSecret, accountURN, grantScopes)
 			if err != nil {
 				return fmt.Errorf("authentication failed: %w", err)
 			}
 			output.PrintSuccess("Authentication successful!")
+			// The endpoint may return fewer scopes than requested, so report what
+			// the token actually carries rather than what was asked for.
+			if tokens.Scope != "" {
+				output.PrintInfo("Granted scopes: %s", tokens.Scope)
+			}
 		} else {
 			output.PrintInfo("Requesting OAuth scopes for safety level %s...", oauthConfig.SafetyLevel)
-
-			// Start OAuth flow with timeout
-			ctx, cancel := context.WithTimeout(context.Background(), timeout)
-			defer cancel()
 
 			output.PrintInfo("Starting OAuth authentication flow...")
 			tokens, err = flow.Start(ctx)
@@ -874,7 +913,7 @@ func init() {
 	authLoginCmd.Flags().String("context", "", "name for the context to create or update (defaults to current context)")
 	authLoginCmd.Flags().String("environment", "", "Dynatrace environment URL (defaults to current context's environment)")
 	authLoginCmd.Flags().String("token-name", "", "name for storing the OAuth token (defaults to existing token name or <context>-oauth)")
-	authLoginCmd.Flags().String("timeout", "5m", "timeout for the authentication flow")
+	authLoginCmd.Flags().String("timeout", "5m", "timeout for the authentication flow (bounds the browser flow and the client credentials token request)")
 	authLoginCmd.Flags().String("safety-level", string(config.DefaultSafetyLevel), "safety level for the context (readonly, readwrite-mine, readwrite-all, dangerously-unrestricted)")
 	authLoginCmd.Flags().String("client-id", "", "OAuth client ID for the non-interactive client credentials grant (env: "+envLoginClientID+")")
 	authLoginCmd.Flags().String("client-secret", "", "OAuth client secret for the client credentials grant; prefer the environment variable (env: "+envLoginClientSecret+")")

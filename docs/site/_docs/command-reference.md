@@ -140,8 +140,9 @@ dtctl auth logout
 dtctl auth refresh
 
 # Non-interactive OAuth login for CI/CD (client credentials grant, no browser)
-DTCTL_CLIENT_ID=... DTCTL_CLIENT_SECRET=... DTCTL_TOKEN_STORAGE=file \
-  dtctl auth login --context <name> --environment <url> --safety-level readonly
+DTCTL_CLIENT_ID=... DTCTL_CLIENT_SECRET=... \
+  DTCTL_ACCOUNT_URN=urn:dtaccount:<uuid> DTCTL_TOKEN_STORAGE=file \
+  dtctl auth login --context <name> --environment <url> --scopes storage:logs:read
 
 # Session status: token presence, expiry, refresh token, granted scopes
 dtctl auth status

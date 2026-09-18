@@ -2,6 +2,7 @@ package session
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -279,7 +280,7 @@ func TestOAuthFlowClientCredentials(t *testing.T) {
 			}, nil
 		}
 
-		tokens, err := flow.ClientCredentials("cid", "csecret", "urn:dtaccount:abc", []string{"storage:logs:read", "storage:events:read"})
+		tokens, err := flow.ClientCredentials(context.Background(), "cid", "csecret", "urn:dtaccount:abc", []string{"storage:logs:read", "storage:events:read"})
 		if err != nil {
 			t.Fatalf("ClientCredentials failed: %v", err)
 		}
@@ -322,7 +323,7 @@ func TestOAuthFlowClientCredentials(t *testing.T) {
 			}, nil
 		}
 
-		if _, err := flow.ClientCredentials("cid", "csecret", "", nil); err != nil {
+		if _, err := flow.ClientCredentials(context.Background(), "cid", "csecret", "", nil); err != nil {
 			t.Fatalf("ClientCredentials failed: %v", err)
 		}
 		if _, ok := got["resource"]; ok {
@@ -340,11 +341,11 @@ func TestOAuthFlowClientCredentials(t *testing.T) {
 			return nil, nil
 		}
 
-		if _, err := flow.ClientCredentials("", "csecret", "", nil); err == nil ||
+		if _, err := flow.ClientCredentials(context.Background(), "", "csecret", "", nil); err == nil ||
 			!strings.Contains(err.Error(), "client ID") {
 			t.Fatalf("expected client ID error, got %v", err)
 		}
-		if _, err := flow.ClientCredentials("cid", "", "", nil); err == nil ||
+		if _, err := flow.ClientCredentials(context.Background(), "cid", "", "", nil); err == nil ||
 			!strings.Contains(err.Error(), "client secret") {
 			t.Fatalf("expected client secret error, got %v", err)
 		}
@@ -361,7 +362,7 @@ func TestOAuthFlowClientCredentials(t *testing.T) {
 			}, nil
 		}
 
-		_, err := flow.ClientCredentials("cid", "supersecret", "", nil)
+		_, err := flow.ClientCredentials(context.Background(), "cid", "supersecret", "", nil)
 		if err == nil {
 			t.Fatal("expected an error")
 		}
@@ -370,6 +371,73 @@ func TestOAuthFlowClientCredentials(t *testing.T) {
 		}
 		if !strings.Contains(err.Error(), "<redacted>") {
 			t.Fatalf("expected redaction marker, got %v", err)
+		}
+	})
+
+	t.Run("redacts percent- and JSON-encoded echoes of the secret", func(t *testing.T) {
+		// A secret containing characters that both encodings change, so a raw
+		// string replacement alone would leave the value readable.
+		const secret = `p@ss w"rd/+`
+
+		flow, _ := NewOAuthFlow(DefaultOAuthConfig())
+		flow.httpDo = func(*http.Request) (*http.Response, error) {
+			body := fmt.Sprintf(`{"error":"invalid_client","sent":%s,"form":"client_secret=%s"}`,
+				mustJSON(t, secret), url.QueryEscape(secret))
+			return &http.Response{
+				StatusCode: http.StatusBadRequest,
+				Status:     "400 Bad Request",
+				Body:       io.NopCloser(strings.NewReader(body)),
+				Header:     make(http.Header),
+			}, nil
+		}
+
+		_, err := flow.ClientCredentials(context.Background(), "cid", secret, "", nil)
+		if err == nil {
+			t.Fatal("expected an error")
+		}
+		for _, leak := range []string{secret, url.QueryEscape(secret), mustJSONInner(t, secret)} {
+			if strings.Contains(err.Error(), leak) {
+				t.Fatalf("secret encoding %q leaked into error: %v", leak, err)
+			}
+		}
+	})
+
+	t.Run("honours the context deadline", func(t *testing.T) {
+		flow, _ := NewOAuthFlow(DefaultOAuthConfig())
+		// Assert the deadline reaches the request rather than relying on a real
+		// stall: the injected httpDo stands in for the transport, which is what
+		// would observe the cancellation in production.
+		flow.httpDo = func(req *http.Request) (*http.Response, error) {
+			if err := req.Context().Err(); err != nil {
+				return nil, err
+			}
+			t.Fatal("expected the expired context to reach the request")
+			return nil, nil
+		}
+
+		ctx, cancel := context.WithTimeout(context.Background(), time.Nanosecond)
+		defer cancel()
+		<-ctx.Done()
+
+		if _, err := flow.ClientCredentials(ctx, "cid", "csecret", "", nil); err == nil ||
+			!errors.Is(err, context.DeadlineExceeded) {
+			t.Fatalf("expected a deadline-exceeded error, got %v", err)
+		}
+	})
+
+	t.Run("tolerates a nil context", func(t *testing.T) {
+		flow, _ := NewOAuthFlow(DefaultOAuthConfig())
+		flow.httpDo = func(*http.Request) (*http.Response, error) {
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Body:       io.NopCloser(strings.NewReader(`{"access_token":"at","expires_in":60}`)),
+				Header:     make(http.Header),
+			}, nil
+		}
+
+		//nolint:staticcheck // passing nil is the case under test
+		if _, err := flow.ClientCredentials(nil, "cid", "csecret", "", nil); err != nil {
+			t.Fatalf("ClientCredentials with a nil context failed: %v", err)
 		}
 	})
 
@@ -383,9 +451,27 @@ func TestOAuthFlowClientCredentials(t *testing.T) {
 			}, nil
 		}
 
-		if _, err := flow.ClientCredentials("cid", "csecret", "", nil); err == nil ||
+		if _, err := flow.ClientCredentials(context.Background(), "cid", "csecret", "", nil); err == nil ||
 			!strings.Contains(err.Error(), "no access token") {
 			t.Fatalf("expected missing access token error, got %v", err)
 		}
 	})
+}
+
+// mustJSON renders v as a JSON string literal, quotes included.
+func mustJSON(t *testing.T, v string) string {
+	t.Helper()
+	encoded, err := json.Marshal(v)
+	if err != nil {
+		t.Fatalf("marshalling %q: %v", v, err)
+	}
+	return string(encoded)
+}
+
+// mustJSONInner renders v as it appears inside a JSON string literal, without
+// the surrounding quotes.
+func mustJSONInner(t *testing.T, v string) string {
+	t.Helper()
+	encoded := mustJSON(t, v)
+	return encoded[1 : len(encoded)-1]
 }

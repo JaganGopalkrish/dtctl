@@ -41,8 +41,10 @@ Prefer the environment variables over the equivalent `--client-id`,
 `--client-secret` and `--account-urn` flags: command line arguments are visible
 to every other process on the machine.
 
-By default the token carries whatever scopes the OAuth client was granted. Pass
-`--scopes` to request a narrower set:
+`--safety-level` restricts dtctl itself, on the client side; it does not narrow
+the token. By default the token carries whatever scopes the OAuth client was
+granted, so pass `--scopes` to request a narrower set — or provision the OAuth
+client with only the scopes the pipeline needs:
 
 ```bash
 dtctl auth login --context ci \
@@ -50,10 +52,19 @@ dtctl auth login --context ci \
   --scopes storage:logs:read,storage:buckets:read
 ```
 
+The token endpoint may return fewer scopes than requested, so `auth login`
+prints the scopes the token actually carries. `dtctl auth status` shows them
+again later.
+
 This grant authenticates the application itself rather than a user, so no
 refresh token is issued ([RFC 6749 §4.4.3](https://www.rfc-editor.org/rfc/rfc6749#section-4.4.3)).
 A client that holds its own credentials does not need one -- run `dtctl auth
-login` again to obtain a fresh access token when the current one expires.
+login` again to obtain a fresh access token when the current one expires. With
+no refresh token stored, a command that runs after expiry fails with
+`no refresh token available` rather than renewing silently.
+
+`--timeout` (default `5m`) bounds the token request, so a stalled token
+endpoint fails the pipeline step instead of holding the runner.
 
 ### Token-Based Auth
 
